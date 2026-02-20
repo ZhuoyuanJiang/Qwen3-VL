@@ -12,6 +12,7 @@ from typing import Optional, Union, Tuple, List, Any, Dict
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
+import soundfile as sf
 import torch
 import torchvision
 from packaging import version
@@ -19,6 +20,9 @@ from PIL import Image
 import numpy as np
 from torchvision import io, transforms
 from torchvision.transforms import InterpolationMode
+
+# Audio constants (Whisper expects 16kHz mono audio)
+AUDIO_SAMPLE_RATE = 16000
 
 
 MAX_RATIO = 200
@@ -480,6 +484,58 @@ def fetch_video(ele: Dict[str, Any], image_patch_size: int = 14, return_video_sa
     return final_video
 
 
+def fetch_audio(ele: Dict[str, Any]) -> Tuple[np.ndarray, int]:
+    """Fetch and decode audio from various input formats.
+
+    Parallel to fetch_image() but for audio. Handles raw bytes, file paths,
+    and numpy arrays. Returns float32 mono audio resampled to 16kHz (Whisper's
+    expected sample rate).
+
+    Args:
+        ele: A dict with an "audio" key. The value can be:
+            - bytes: raw audio bytes (e.g., from dataset sample['wav']['bytes'])
+            - str: a file path to an audio file
+            - np.ndarray: a pre-loaded audio array
+
+    Returns:
+        Tuple of (audio_array, sample_rate) where audio_array is a float32
+        mono numpy array and sample_rate is always AUDIO_SAMPLE_RATE (16000).
+    """
+    audio = ele["audio"]
+
+    if isinstance(audio, np.ndarray):
+        # Already a numpy array — just need to ensure float32 and mono
+        audio_array = audio.astype(np.float32)
+        sr = ele.get("sampling_rate", AUDIO_SAMPLE_RATE)
+    elif isinstance(audio, bytes):
+        # Raw bytes from dataset (e.g., sample['wav']['bytes'])
+        audio_array, sr = sf.read(BytesIO(audio))
+        audio_array = audio_array.astype(np.float32)
+    elif isinstance(audio, str):
+        # File path
+        if audio.startswith("file://"):
+            audio = audio[7:]
+        audio_array, sr = sf.read(audio)
+        audio_array = audio_array.astype(np.float32)
+    else:
+        raise ValueError(
+            f"Unrecognized audio input type: {type(audio)}. "
+            "Supported: bytes, file path (str), or numpy array."
+        )
+
+    # Stereo to mono
+    if audio_array.ndim > 1:
+        audio_array = audio_array.mean(axis=1)
+
+    # Resample to 16kHz if needed
+    if sr != AUDIO_SAMPLE_RATE:
+        import librosa
+        audio_array = librosa.resample(audio_array, orig_sr=sr, target_sr=AUDIO_SAMPLE_RATE)
+        sr = AUDIO_SAMPLE_RATE
+
+    return audio_array, sr
+
+
 def extract_vision_info(conversations: Union[List[Dict[str, Any]], List[List[Dict[str, Any]]]]) -> List[Dict[str, Any]]:
     vision_infos = []
     if isinstance(conversations[0], dict):
@@ -492,7 +548,8 @@ def extract_vision_info(conversations: Union[List[Dict[str, Any]], List[List[Dic
                         "image" in ele
                         or "image_url" in ele
                         or "video" in ele
-                        or ele.get("type", "text") in ("image", "image_url", "video")
+                        or "audio" in ele
+                        or ele.get("type", "text") in ("image", "image_url", "video", "audio")
                     ):
                         vision_infos.append(ele)
     return vision_infos
@@ -506,9 +563,10 @@ def process_vision_info(
 ) -> Tuple[Optional[List[Image.Image]], Optional[List[Union[torch.Tensor, List[Image.Image]]]], Optional[Dict[str, Any]]]:
 
     vision_infos = extract_vision_info(conversations)
-    ## Read images or videos
+    ## Read images, videos, or audios
     image_inputs = []
     video_inputs = []
+    audio_inputs = []
     video_sample_fps_list = []
     for vision_info in vision_infos:
         if "image" in vision_info or "image_url" in vision_info:
@@ -518,17 +576,21 @@ def process_vision_info(
                         image_patch_size=image_patch_size, return_video_metadata=return_video_metadata)
             video_sample_fps_list.append(video_sample_fps)
             video_inputs.append(video_input)
+        elif "audio" in vision_info:
+            audio_inputs.append(fetch_audio(vision_info))
         else:
-            raise ValueError("image, image_url or video should in content.")
+            raise ValueError("image, image_url, video or audio should in content.")
     if len(image_inputs) == 0:
         image_inputs = None
     if len(video_inputs) == 0:
         video_inputs = None
+    if len(audio_inputs) == 0:
+        audio_inputs = None
 
     video_kwargs = {'do_sample_frames': False}
     if not return_video_metadata: # BC for qwen2.5vl
         video_kwargs.update({'fps': video_sample_fps_list})
 
     if return_video_kwargs:
-        return image_inputs, video_inputs, video_kwargs
-    return image_inputs, video_inputs
+        return image_inputs, video_inputs, audio_inputs, video_kwargs
+    return image_inputs, video_inputs, audio_inputs
